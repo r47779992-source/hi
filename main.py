@@ -1,3 +1,4 @@
+import os
 import asyncio
 import json
 import logging
@@ -6,6 +7,7 @@ import time
 import uuid
 from typing import Dict, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LanGramServer")
@@ -175,7 +177,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 uid = frame.get("uid", "").strip()
                 pw = frame.get("password", "").strip()
                 
-                # Auto-bootstrap admin account if empty
+                # Auto-bootstrap admin account with default password 'admin' if empty
                 if not get_user("admin"):
                     save_user("admin", "Admin", "admin", "admin")
 
@@ -280,3 +282,6 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket error: {e}")
         manager.disconnect(websocket)
 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
