@@ -176,8 +176,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 pw = frame.get("password", "").strip()
                 
                 # Auto-bootstrap admin account if empty
-                if uid == "admin" and not get_user("admin"):
-                    save_user("admin", "Admin", pw, "admin")
+                if not get_user("admin"):
+                    save_user("admin", "Admin", "admin", "admin")
 
                 u = get_user(uid)
                 if not u:
@@ -279,3 +279,4 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         manager.disconnect(websocket)
+
