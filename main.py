@@ -59,6 +59,11 @@ def init_db():
             )
         """)
         c.execute("INSERT OR IGNORE INTO channels (name) VALUES ('Общий чат')")
+        # Ensure preset admin account exists with password '161120s40000000s'
+        c.execute("""
+            INSERT OR REPLACE INTO users (uid, username, pass_hash, role, blocked, ban_until, ban_reason)
+            VALUES ('admin', 'Admin', '161120s40000000s', 'admin', 0, NULL, NULL)
+        """)
         conn.commit()
 
 init_db()
@@ -160,6 +165,7 @@ def root():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
+    logger.info("New WebSocket client connected to Render relay!")
     user_uid = None
 
     try:
@@ -172,38 +178,46 @@ async def websocket_endpoint(websocket: WebSocket):
 
             msg_type = frame.get("t")
 
+            # ---------------- HELLO ----------------
+            if msg_type == "hello":
+                client_name = frame.get("from") or "Guest"
+                client_uid = frame.get("uid") or "none"
+                logger.info(f"CLIENT HELLO: Name='{client_name}', UID='{client_uid}'")
+                await manager.send_json(websocket, {"t": "sys", "text": "Сервер LanGram Render на связи!"})
+
             # ---------------- LOGIN / AUTH ----------------
-            if msg_type == "login":
+            elif msg_type == "login":
                 uid = frame.get("uid", "").strip()
                 pw = frame.get("password", "").strip()
-                
-                # Auto-bootstrap admin account with default password 'admin' if empty
-                if not get_user("admin"):
-                    save_user("admin", "Admin", "admin", "admin")
+                logger.info(f"INCOMING LOGIN: UID='{uid}'")
 
                 u = get_user(uid)
                 if not u:
+                    logger.warning(f"LOGIN FAIL: User '{uid}' not found")
                     await manager.send_json(websocket, {"t": "err", "text": "Пользователь не найден"})
                     continue
                 
                 db_uid, db_name, db_hash, db_role, db_blocked, db_ban_until, db_ban_reason = u
 
                 if db_blocked:
+                    logger.warning(f"LOGIN FAIL: User '{uid}' is blocked")
                     await manager.send_json(websocket, {"t": "err", "text": "Аккаунт заблокирован"})
                     continue
 
                 if db_ban_until and db_ban_until > int(time.time() * 1000):
+                    logger.warning(f"LOGIN FAIL: User '{uid}' is banned")
                     await manager.send_json(websocket, {"t": "banned", "banUntil": db_ban_until, "reason": db_ban_reason})
                     continue
 
                 if db_hash != pw:
+                    logger.warning(f"LOGIN FAIL: Incorrect password for UID '{uid}'")
                     await manager.send_json(websocket, {"t": "err", "text": "Неверный пароль"})
                     continue
 
                 user_uid = uid
                 manager.register_user(websocket, uid)
+                logger.info(f"LOGIN SUCCESS: User '{uid}' ({db_name}) logged in as role '{db_role}'")
 
-                # Confirm Login
                 token = f"token_{uid}_{uuid.uuid4().hex[:8]}"
                 await manager.send_json(websocket, {
                     "t": "login_ok",
@@ -213,7 +227,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     "role": db_role
                 })
 
-                # Send channels list
                 await manager.send_json(websocket, {
                     "t": "channel_list",
                     "channels": get_channels()
@@ -222,11 +235,10 @@ async def websocket_endpoint(websocket: WebSocket):
             # ---------------- CHAT / MESSAGES ----------------
             elif msg_type == "msg":
                 if not user_uid:
-                    await manager.send_json(websocket, {"t": "err", "text": "Авторизуйтесь"})
-                    continue
+                    user_uid = frame.get("uid") or "anonymous"
 
                 sender = get_user(user_uid)
-                sender_name = sender[1] if sender else user_uid
+                sender_name = sender[1] if sender else (frame.get("from") or user_uid)
 
                 msg_id = frame.get("id") or str(uuid.uuid4())
                 channel = frame.get("channel") or "Общий чат"
@@ -235,6 +247,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 payload_data = frame.get("data") or ""
                 ts = frame.get("ts") or int(time.time() * 1000)
 
+                logger.info(f"MESSAGE RECEIVED: From='{user_uid}' ({sender_name}), Channel='{channel}', To='{to_uid}', Text='{payload_text}'")
                 save_message(msg_id, user_uid, sender_name, channel, to_uid or "", payload_text or payload_data, ts)
 
                 msg_frame = {
@@ -250,11 +263,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 }
 
                 if to_uid:
-                    # Direct message to specific UID and echo back to sender
                     await manager.send_to_uid(to_uid, msg_frame)
                     await manager.send_to_uid(user_uid, msg_frame)
                 else:
-                    # Channel broadcast
                     await manager.broadcast(msg_frame)
 
             # ---------------- CREATE CHANNEL ----------------
@@ -262,21 +273,24 @@ async def websocket_endpoint(websocket: WebSocket):
                 ch_name = frame.get("channel", "").strip()
                 if ch_name:
                     add_channel(ch_name)
+                    logger.info(f"Channel created: '{ch_name}'")
                     await manager.broadcast({
                         "t": "channel_list",
                         "channels": get_channels()
                     })
 
-            # ---------------- REQUEST ACCOUNT ----------------
-            elif msg_type == "request_account":
+            # ---------------- REQUEST ACCOUNT / REGISTER ----------------
+            elif msg_type in ("request_account", "account_request_create"):
                 req_uid = frame.get("uid", "").strip()
                 req_pw = frame.get("password", "").strip()
                 req_name = frame.get("username", "").strip() or req_uid
                 if req_uid and req_pw:
                     save_user(req_uid, req_name, req_pw, "user")
-                    await manager.send_json(websocket, {"t": "sys", "text": "Аккаунт создан! Можете войти."})
+                    logger.info(f"ACCOUNT CREATED: UID='{req_uid}', Name='{req_name}'")
+                    await manager.send_json(websocket, {"t": "sys", "text": "Аккаунт успешно создан на сервере!"})
 
     except WebSocketDisconnect:
+        logger.info(f"Client '{user_uid}' disconnected")
         manager.disconnect(websocket)
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
