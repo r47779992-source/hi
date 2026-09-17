@@ -35,9 +35,14 @@ def init_db():
                 ban_until INTEGER,
                 ban_reason TEXT,
                 email TEXT,
-                email_verified INTEGER DEFAULT 0
+                email_verified INTEGER DEFAULT 0,
+                last_seen INTEGER
             )
         """)
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN last_seen INTEGER")
+        except Exception:
+            pass
         c.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 name TEXT PRIMARY KEY
@@ -157,8 +162,25 @@ manager = ConnectionManager()
 def get_user(uid: str):
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        c.execute("SELECT uid, username, pass_hash, role, blocked, ban_until, ban_reason, email, email_verified FROM users WHERE uid = ? OR username = ?", (uid, uid))
+        c.execute("SELECT uid, username, pass_hash, role, blocked, ban_until, ban_reason, email, email_verified, last_seen FROM users WHERE uid = ? OR username = ?", (uid, uid))
         return c.fetchone()
+
+def update_last_seen(uid: str):
+    now = int(time.time() * 1000)
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET last_seen = ? WHERE uid = ?", (now, uid))
+        conn.commit()
+
+def get_user_status(uid: str) -> dict:
+    is_online = uid in manager.uid_connections and len(manager.uid_connections[uid]) > 0
+    u = get_user(uid)
+    last_seen = u[9] if u and len(u) > 9 else None
+    return {
+        "uid": uid,
+        "online": is_online,
+        "lastSeen": last_seen
+    }
 
 def save_user(uid: str, username: str, pass_hash: str, role: str):
     with sqlite3.connect(DB_FILE) as conn:
@@ -222,8 +244,21 @@ async def websocket_endpoint(websocket: WebSocket):
 
             msg_type = frame.get("t")
 
+            # ---------------- PING / HEARTBEAT ----------------
+            if msg_type == "ping":
+                if user_uid:
+                    update_last_seen(user_uid)
+                await manager.send_json(websocket, {"t": "pong", "ts": int(time.time() * 1000)})
+
+            # ---------------- GET USER STATUS ----------------
+            elif msg_type == "get_user_status":
+                target_uid = frame.get("target") or user_uid
+                if target_uid:
+                    status = get_user_status(target_uid)
+                    await manager.send_json(websocket, {"t": "user_status", "status": status})
+
             # ---------------- HELLO ----------------
-            if msg_type == "hello":
+            elif msg_type == "hello":
                 client_name = frame.get("from") or "Guest"
                 client_uid = frame.get("uid") or "none"
                 logger.info(f"CLIENT HELLO: Name='{client_name}', UID='{client_uid}'")
