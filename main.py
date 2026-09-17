@@ -200,25 +200,45 @@ def save_message(msg_id: str, sender_uid: str, sender_name: str, channel: str, t
         """, (msg_id, sender_uid, sender_name, channel, to_uid, payload_data, ts))
         conn.commit()
 
-def send_gmail_otp(recipient_email: str, code: str) -> bool:
-    """Sends OTP code via Gmail SMTP if credentials are configured."""
-    if not GMAIL_SENDER_EMAIL or not GMAIL_APP_PASSWORD:
-        logger.info(f"[GMAIL FALLBACK OTP] To: '{recipient_email}', Code: '{code}'")
-        return True
-    try:
-        msg = MIMEText(f"Ваш код подтверждения личности для LanGram: {code}\nКод действителен 10 минут.")
-        msg['Subject'] = 'Код подтверждения LanGram'
-        msg['From'] = GMAIL_SENDER_EMAIL
-        msg['To'] = recipient_email
+def send_gmail_otp_sync(recipient_email: str, code: str) -> tuple[bool, str]:
+    """Sends OTP code via Gmail SMTP trying port 587 (STARTTLS) and fallback port 465 (SSL)."""
+    sender = os.environ.get("GMAIL_SENDER_EMAIL", "").strip()
+    password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
 
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(GMAIL_SENDER_EMAIL, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_SENDER_EMAIL, [recipient_email], msg.as_string())
-        logger.info(f"SUCCESS: Gmail OTP sent to {recipient_email}")
-        return True
-    except Exception as e:
-        logger.error(f"Gmail SMTP send failed: {e}")
-        return False
+    if not sender or not password:
+        msg = f"Внимание: переменные GMAIL_SENDER_EMAIL или GMAIL_APP_PASSWORD не настроены в Render! (Тестовый код: {code})"
+        logger.warning(msg)
+        return (False, msg)
+
+    body = f"Ваш код подтверждения личности для LanGram: {code}\nКод действителен 10 минут."
+    msg = MIMEText(body, 'plain', 'utf-8')
+    msg['Subject'] = 'Код подтверждения LanGram'
+    msg['From'] = sender
+    msg['To'] = recipient_email
+
+    # Attempt 1: Port 587 TLS
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=12) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(sender, password)
+            server.sendmail(sender, [recipient_email], msg.as_string())
+        logger.info(f"SUCCESS: Gmail OTP sent via port 587 to {recipient_email}")
+        return (True, "OK")
+    except Exception as e1:
+        logger.warning(f"Port 587 failed ({e1}), trying port 465 SSL...")
+
+    # Attempt 2: Port 465 SSL
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=12) as server:
+            server.login(sender, password)
+            server.sendmail(sender, [recipient_email], msg.as_string())
+        logger.info(f"SUCCESS: Gmail OTP sent via port 465 to {recipient_email}")
+        return (True, "OK")
+    except Exception as e2:
+        err_msg = f"Ошибка отправки Gmail SMTP: {e2}"
+        logger.error(err_msg)
+        return (False, err_msg)
 
 @app.get("/")
 def root():
@@ -255,7 +275,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 target_uid = frame.get("target") or user_uid
                 if target_uid:
                     status = get_user_status(target_uid)
-                    await manager.send_json(websocket, {"t": "user_status", "status": status})
+                    await manager.send_json(websocket, {
+                        "t": "user_status",
+                        "target": status["uid"],
+                        "text": "online" if status["online"] else "offline",
+                        "ts": status["lastSeen"]
+                    })
 
             # ---------------- HELLO ----------------
             elif msg_type == "hello":
@@ -332,8 +357,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     c.execute("INSERT OR REPLACE INTO email_verifications (uid, email, code, expires, verified) VALUES (?, ?, ?, ?, 0)",
                               (user_uid, email, code, expires))
                     conn.commit()
-                send_gmail_otp(email, code)
-                await manager.send_json(websocket, {"t": "sys", "text": f"Код подтверждения отправлен на {email}"})
+                success, detail = await asyncio.to_thread(send_gmail_otp_sync, email, code)
+                if success:
+                    await manager.send_json(websocket, {"t": "sys", "text": f"Код подтверждения отправлен на {email}"})
+                else:
+                    await manager.send_json(websocket, {"t": "err", "text": detail})
 
             elif msg_type == "verify_email_code":
                 code_input = frame.get("code", "").strip()
