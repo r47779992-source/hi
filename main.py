@@ -19,8 +19,8 @@ app = FastAPI(title="LanGram Secure Relay Server")
 DB_FILE = "server.db"
 
 # Gmail SMTP configuration (optional via environment variables)
-GMAIL_SENDER_EMAIL = os.environ.get("GMAIL_SENDER_EMAIL", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+GMAIL_SENDER_EMAIL = "savx564@gmail.com"
+GMAIL_APP_PASSWORD = "xywa glkj wckq evig"
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
@@ -111,6 +111,15 @@ def init_db():
                 PRIMARY KEY (group_id, uid)
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS complaints (
+                id TEXT PRIMARY KEY,
+                from_uid TEXT,
+                target_uid TEXT,
+                reason TEXT,
+                ts INTEGER
+            )
+        """)
         # Ensure default preset Admin account
         c.execute("""
             INSERT OR REPLACE INTO users (uid, username, pass_hash, role, blocked, ban_until, ban_reason)
@@ -162,7 +171,7 @@ manager = ConnectionManager()
 def get_user(uid: str):
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
-        c.execute("SELECT uid, username, pass_hash, role, blocked, ban_until, ban_reason, email, email_verified, last_seen FROM users WHERE uid = ? OR username = ?", (uid, uid))
+        c.execute("SELECT uid, username, pass_hash, role, blocked, ban_until, ban_reason, email, email_verified, last_seen FROM users WHERE uid = ? OR username = ? OR email = ?", (uid, uid, uid))
         return c.fetchone()
 
 def update_last_seen(uid: str):
@@ -181,6 +190,14 @@ def get_user_status(uid: str) -> dict:
         "online": is_online,
         "lastSeen": last_seen
     }
+
+async def broadcast_to_admins(data: dict):
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute("SELECT uid FROM users WHERE role IN ('admin', 'mod')")
+        admin_uids = {row[0] for row in c.fetchall()}
+    for uid in admin_uids:
+        await manager.send_to_uid(uid, data)
 
 def save_user(uid: str, username: str, pass_hash: str, role: str):
     with sqlite3.connect(DB_FILE) as conn:
@@ -202,8 +219,8 @@ def save_message(msg_id: str, sender_uid: str, sender_name: str, channel: str, t
 
 def send_gmail_otp_sync(recipient_email: str, code: str) -> tuple[bool, str]:
     """Sends OTP code via Gmail SMTP trying port 587 (STARTTLS) and fallback port 465 (SSL)."""
-    sender = os.environ.get("GMAIL_SENDER_EMAIL", "").strip()
-    password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+    sender = (GMAIL_SENDER_EMAIL or os.environ.get("GMAIL_SENDER_EMAIL", "")).strip()
+    password = (GMAIL_APP_PASSWORD or os.environ.get("GMAIL_APP_PASSWORD", "")).replace(" ", "").strip()
 
     if not sender or not password:
         msg = f"Внимание: переменные GMAIL_SENDER_EMAIL или GMAIL_APP_PASSWORD не настроены в Render! (Тестовый код: {code})"
@@ -240,7 +257,7 @@ def send_gmail_otp_sync(recipient_email: str, code: str) -> tuple[bool, str]:
         logger.error(err_msg)
         return (False, err_msg)
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
         "status": "online",
@@ -298,10 +315,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 u = get_user(uid)
                 if not u:
                     logger.warning(f"LOGIN FAIL: User '{uid}' not found")
-                    await manager.send_json(websocket, {"t": "err", "text": "Пользователь не найден"})
+                    err_txt = "У вас не привязана почта" if "@" in uid else "Пользователь не найден"
+                    await manager.send_json(websocket, {"t": "err", "text": err_txt})
                     continue
                 
-                db_uid, db_name, db_hash, db_role, db_blocked, db_ban_until, db_ban_reason, db_email, db_verified = u
+                db_uid, db_name, db_hash, db_role, db_blocked, db_ban_until, db_ban_reason, db_email, db_verified, *rest = u
 
                 if db_blocked:
                     await manager.send_json(websocket, {"t": "err", "text": "Аккаунт заблокирован"})
@@ -317,6 +335,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 user_uid = db_uid
                 manager.register_user(websocket, db_uid)
+                update_last_seen(db_uid)
                 logger.info(f"LOGIN SUCCESS: User '{db_uid}' (@{db_name}) logged in")
 
                 token = f"token_{db_uid}_{uuid.uuid4().hex[:8]}"
@@ -325,8 +344,52 @@ async def websocket_endpoint(websocket: WebSocket):
                     "token": token,
                     "uid": db_uid,
                     "from": db_name,
-                    "role": db_role
+                    "role": db_role,
+                    "email": db_email,
+                    "emailVerified": bool(db_verified)
                 })
+                # Broadcast online status
+                await manager.broadcast({"t": "user_status", "target": db_uid, "text": "online", "ts": int(time.time() * 1000)})
+
+            # ---------------- GET CHANNELS ----------------
+            elif msg_type in ("get_channels", "channel_list_request"):
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT name FROM channels")
+                    ch_rows = [r[0] for r in c.fetchall()]
+                channels = list(dict.fromkeys(["Общий чат"] + ch_rows))
+                await manager.send_json(websocket, {"t": "channel_list", "channels": channels})
+
+            # ---------------- COMPLAINTS ----------------
+            elif msg_type == "complaint":
+                target = frame.get("target", "").strip()
+                reason = frame.get("reason", "").strip()
+                c_id = str(uuid.uuid4())
+                now = int(time.time() * 1000)
+                if target and reason and user_uid:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        c = conn.cursor()
+                        c.execute("INSERT INTO complaints (id, from_uid, target_uid, reason, ts) VALUES (?, ?, ?, ?, ?)",
+                                  (c_id, user_uid, target, reason, now))
+                        conn.commit()
+                    logger.info(f"COMPLAINT SUBMITTED: From '{user_uid}' against '{target}'")
+                    await manager.send_json(websocket, {"t": "sys", "text": "Жалоба отправлена модераторам!"})
+                    await broadcast_to_admins({"t": "complaint_item", "id": c_id, "fromUid": user_uid, "targetUid": target, "reason": reason, "ts": now})
+
+            elif msg_type in ("complaint_list", "request_complaints"):
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT id, from_uid, target_uid, reason, ts FROM complaints ORDER BY ts DESC LIMIT 100")
+                    rows = c.fetchall()
+                for r in rows:
+                    await manager.send_json(websocket, {
+                        "t": "complaint_item",
+                        "id": r[0],
+                        "fromEmail": r[1],
+                        "targetEmail": r[2],
+                        "reason": r[3],
+                        "ts": r[4]
+                    })
 
             # ---------------- REQUEST ACCOUNT (SUBMIT TO ADMIN) ----------------
             elif msg_type in ("request_account", "account_request_create"):
@@ -342,7 +405,107 @@ async def websocket_endpoint(websocket: WebSocket):
                                   (req_id, req_uid, req_name, req_pw, now))
                         conn.commit()
                     logger.info(f"ACCOUNT REQUEST SUBMITTED TO ADMIN: UID='{req_uid}'")
+                    item_frame = {
+                        "t": "account_request_item",
+                        "requestId": req_id,
+                        "uid": req_uid,
+                        "username": req_name,
+                        "ts": now
+                    }
+                    await broadcast_to_admins(item_frame)
                     await manager.send_json(websocket, {"t": "sys", "text": "Заявка отправлена администратору! Ожидайте одобрения."})
+
+            elif msg_type == "account_request_list":
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT id, uid, username, ts FROM account_requests ORDER BY ts DESC")
+                    rows = c.fetchall()
+                for r in rows:
+                    await manager.send_json(websocket, {
+                        "t": "account_request_item",
+                        "requestId": r[0],
+                        "uid": r[1],
+                        "username": r[2],
+                        "ts": r[3]
+                    })
+
+            elif msg_type == "account_request_approve":
+                req_id = frame.get("requestId", "").strip()
+                if req_id:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        c = conn.cursor()
+                        c.execute("SELECT uid, username, pass_hash FROM account_requests WHERE id = ?", (req_id,))
+                        row = c.fetchone()
+                        if row:
+                            r_uid, r_name, r_pw = row
+                            save_user(r_uid, r_name, r_pw, "user")
+                            c.execute("DELETE FROM account_requests WHERE id = ?", (req_id,))
+                            conn.commit()
+                            logger.info(f"ACCOUNT APPROVED BY ADMIN: UID='{r_uid}'")
+                            await manager.send_json(websocket, {"t": "sys", "text": f"Заявка {r_uid} одобрена!"})
+                            await manager.send_to_uid(r_uid, {"t": "sys", "text": "Ваша заявка одобрена! Теперь вы можете войти."})
+                        else:
+                            await manager.send_json(websocket, {"t": "err", "text": "Заявка не найдена"})
+
+            elif msg_type == "account_request_reject":
+                req_id = frame.get("requestId", "").strip()
+                if req_id:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        c = conn.cursor()
+                        c.execute("DELETE FROM account_requests WHERE id = ?", (req_id,))
+                        conn.commit()
+                    logger.info(f"ACCOUNT REJECTED BY ADMIN: ID='{req_id}'")
+                    await manager.send_json(websocket, {"t": "sys", "text": "Заявка отклонена"})
+
+            elif msg_type == "admin_add_user":
+                target_uid = frame.get("uid", "").strip()
+                target_pw = frame.get("password", "").strip()
+                target_name = frame.get("username", "").strip() or target_uid
+                target_role = frame.get("role", "user").strip()
+                if target_uid and target_pw:
+                    save_user(target_uid, target_name, target_pw, target_role)
+                    logger.info(f"ADMIN CREATED USER: UID='{target_uid}', Role='{target_role}'")
+                    await manager.send_json(websocket, {"t": "sys", "text": f"Пользователь {target_uid} создан!"})
+                else:
+                    await manager.send_json(websocket, {"t": "err", "text": "Заполните ID и пароль"})
+
+            elif msg_type == "admin_del_user":
+                target_uid = frame.get("target", "").strip()
+                if target_uid:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        c = conn.cursor()
+                        c.execute("DELETE FROM users WHERE uid = ?", (target_uid,))
+                        conn.commit()
+                    logger.info(f"ADMIN DELETED USER: UID='{target_uid}'")
+                    await manager.send_json(websocket, {"t": "sys", "text": f"Пользователь {target_uid} удалён"})
+
+            # ---------------- CREATE CHANNEL ----------------
+            elif msg_type == "create_channel":
+                ch_name = (frame.get("channel") or frame.get("name") or "").strip()
+                if ch_name:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        c = conn.cursor()
+                        c.execute("INSERT OR IGNORE INTO channels (name) VALUES (?)", (ch_name,))
+                        conn.commit()
+                    logger.info(f"CHANNEL CREATED: Name='{ch_name}'")
+                    await manager.send_json(websocket, {"t": "sys", "text": f"Канал создан: {ch_name}"})
+                    with sqlite3.connect(DB_FILE) as conn:
+                        c = conn.cursor()
+                        c.execute("SELECT name FROM channels")
+                        ch_rows = [r[0] for r in c.fetchall()]
+                    channels = list(dict.fromkeys(["Общий чат"] + ch_rows))
+                    await manager.broadcast({"t": "channel_list", "channels": channels})
+
+            # ---------------- DELETE MESSAGE ----------------
+            elif msg_type in ("delete_msg", "del_msg"):
+                msg_id = frame.get("id") or frame.get("msgId")
+                if msg_id:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        c = conn.cursor()
+                        c.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
+                        conn.commit()
+                    logger.info(f"MESSAGE DELETED: ID='{msg_id}'")
+                    await manager.broadcast({"t": "msg_deleted", "id": msg_id})
 
             # ---------------- EMAIL VERIFICATION OTP ----------------
             elif msg_type == "send_email_code":
@@ -381,6 +544,18 @@ async def websocket_endpoint(websocket: WebSocket):
                         await manager.send_json(websocket, {"t": "email_verified", "email": email})
                     else:
                         await manager.send_json(websocket, {"t": "err", "text": "Неверный или просроченный код"})
+
+            elif msg_type == "unbind_email":
+                if not user_uid:
+                    await manager.send_json(websocket, {"t": "err", "text": "Требуется авторизация"})
+                    continue
+                with sqlite3.connect(DB_FILE) as conn:
+                    c = conn.cursor()
+                    c.execute("UPDATE users SET email = NULL, email_verified = 0 WHERE uid = ?", (user_uid,))
+                    c.execute("DELETE FROM email_verifications WHERE uid = ?", (user_uid,))
+                    conn.commit()
+                logger.info(f"EMAIL UNBOUND: User '{user_uid}'")
+                await manager.send_json(websocket, {"t": "email_unbound", "uid": user_uid})
 
             # ---------------- FRIEND REQUESTS ----------------
             elif msg_type == "friend_request_send":
@@ -489,9 +664,15 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         logger.info(f"Client '{user_uid}' disconnected")
         manager.disconnect(websocket)
+        if user_uid:
+            update_last_seen(user_uid)
+            asyncio.create_task(manager.broadcast({"t": "user_status", "target": user_uid, "text": "offline", "ts": int(time.time() * 1000)}))
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         manager.disconnect(websocket)
+        if user_uid:
+            update_last_seen(user_uid)
+            asyncio.create_task(manager.broadcast({"t": "user_status", "target": user_uid, "text": "offline", "ts": int(time.time() * 1000)}))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
