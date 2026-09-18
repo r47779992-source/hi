@@ -19,8 +19,8 @@ app = FastAPI(title="LanGram Secure Relay Server")
 DB_FILE = "server.db"
 
 # Gmail SMTP configuration (optional via environment variables)
-GMAIL_SENDER_EMAIL = "savx564@gmail.com"
-GMAIL_APP_PASSWORD = "xywa glkj wckq evig"
+GMAIL_SENDER_EMAIL = ""
+GMAIL_APP_PASSWORD = ""
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
